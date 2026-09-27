@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>Монітор Києва v14.17.0</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html,body,#map{height:100%;margin:0;background:#0b0f14;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+  #panel{position:absolute;top:10px;right:10px;z-index:1000;width:320px;background:#11161d;color:#e6edf3;
+         border:1px solid #2a3441;border-radius:10px;padding:10px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  #panel textarea{width:100%;height:90px;background:#0b0f14;color:#e6edf3;border:1px solid #2a3441;
+                  border-radius:8px;padding:8px;box-sizing:border-box;resize:vertical;font-size:12px}
+  #panel button{margin-top:6px;margin-right:6px;background:#1f6feb;color:#fff;border:0;border-radius:6px;
+                padding:6px 10px;cursor:pointer;font-size:12px}
+  #panel button.sec{background:#30363d}
+  #panel button:hover{filter:brightness(1.15)}
+  #log{margin-top:8px;max-height:100px;overflow:auto;font-size:11px;color:#8b949e;line-height:1.4}
+
+  /* Сводка */
+  #summary{margin-top:8px;border-top:1px solid #2a3441;padding-top:8px;font-size:12px;line-height:1.55;color:#e6edf3}
+  #summary .row{margin-bottom:4px}
+  #summary .muted{color:#8b949e;font-size:11px;margin-top:6px}
+  #summary button{margin-top:4px;font-size:11px;padding:4px 8px}
+
+  .leaflet-popup-content-wrapper{background:#11161d;color:#e6edf3;border:1px solid #2a3441;border-radius:8px}
+  .leaflet-popup-tip{background:#11161d}
+  .leaflet-popup-content{margin:10px 12px;font-size:13px;line-height:1.45}
+
+  /* Контейнер іконки */
+  .mk-wrap{position:relative;width:40px;height:40px}
+  /* Кружок підтвердження */
+  .mk{position:absolute;inset:0;border-radius:50%;
+      background:rgba(17,22,29,.85);border:2px solid #58a6ff;
+      box-shadow:0 0 8px rgba(88,166,255,.5);
+      display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#fff}
+  .mk.c2{border-color:#3fb950;box-shadow:0 0 10px rgba(63,185,80,.7)}
+  .mk.c3{border-color:#d29922;box-shadow:0 0 12px rgba(210,153,34,.8)}
+  .mk.c5{border-color:#f85149;box-shadow:0 0 16px rgba(248,81,73,.9)}
+  /* Стрілка-ракета, обертається навколо центру */
+  .arrow{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+         font-size:18px;line-height:1;pointer-events:none;
+         transform-origin:50% 50%;
+         filter:drop-shadow(0 0 3px rgba(248,81,73,.9))}
+  .arrow-body{display:inline-block;transform:rotate(var(--rot,0deg))}
+
+  #attr{position:absolute;bottom:4px;right:6px;z-index:1000;font-size:10px;color:#8b949e;
+        background:rgba(11,15,20,.7);padding:2px 6px;border-radius:4px}
+  #attr a{color:#58a6ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <div style="font-size:13px;font-weight:600;margin-bottom:6px">Монітор Києва · v14.17.0</div>
+  <textarea id="input" placeholder="Вставте текст із Telegram-каналу…"></textarea>
+  <button onclick="processInput()">Обробити</button>
+  <button class="sec" onclick="loadTests()">Тести</button>
+  <button class="sec" onclick="clearAll()">Очистити</button>
+
+  <div id="summary">
+    <div class="row">🔴 Київ: <b>ПОВІТРЯНА ТРЕВОГА</b></div>
+    <div class="row" style="color:#d29922">Причина: Дронова загроза (жовтий рівень)</div>
+    <div class="row" id="s-tracks">✈️ API-треків у зоні: 0</div>
+    <div class="row" id="s-types" style="color:#8b949e;font-size:11px;padding-left:18px">• БПЛА: 0</div>
+    <div class="row">🤖 AI: критичних подій немає</div>
+    <div class="muted" id="s-updated">Оновлено: —</div>
+    <button class="sec" onclick="copySummary()">📋 Копіювати</button>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<div id="attr">© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors</div>
+
+<script>
+/* ============================================================
+   1. КОНФІГ
+   ============================================================ */
+const CONFIG = {
+  TTL_MIN: 30,
+  CONFIRM_2: 2,
+  CONFIRM_3: 3,
+  CONFIRM_5: 5,
+  BASE_ANGLE: 225   // базова орієнтація стрілки (Пд-Зх) у градусах
+};
+
+/* API-треки (для сводки). У реальному коді — з бекенду. */
+const API_TRACKS = { total: 0, byType: { 'БПЛА': 0, 'Ракета': 0 } };
+
+/* ============================================================
+   2. МІКРОРАЙОНИ (заглушки — вставте свої 112)
+   ============================================================ */
+const DISTRICTS = {
+  "шулявка":    { lat: 50.4550, lng: 30.4450 },
+  "відрадний":  { lat: 50.4260, lng: 30.4260 },
+  "солом'янка": { lat: 50.4270, lng: 30.4600 },
+  "вишгород":   { lat: 50.5840, lng: 30.4850 },
+  // ... решта 108 — за зразком:
+  // "назва_малими": { lat: 0, lng: 0 },
+};
+
+/* ============================================================
+   3. РЕГЕКСПИ
+   ============================================================ */
+const IMPACT_RE    = /(влучанн|попаданн|приліт|прилет)/i;
+const EXPLOSION_RE = /(вибух|взрыв|blast)/i;
+const FIRE_RE      = /(пожеж|пожар|fire|займанн)/i;
+const AA_RE        = /(ппо|пво|працює\s*ппо|air\s*defen)/i;
+const FALL_RE      = /(шахед|шахід|ракет|падає|падает|падінн|крилат|герань)/i;
+
+const POVZ_RE   = /повз\s+([а-яїієґ'’\-\s]+?)\s+на\s+([а-яїієґ'’\-\s]+?)(?:[.,!?]|$)/i;
+const KURS_RE   = /курс(?:ом)?\s+на\s+([а-яїієґ'’\-\s]+?)(?:[.,!?]|$)/i;
+const TARGET_RE = /(?:^|[\s.,!])(?:на|в|у)\s+([А-ЯЇІЄҐ][а-яїієґ'’\-]+)/g;
+
+const JUNK_RE = /@[A-Za-z0-9_]+|—\s*[А-ЯA-ZІЇЄҐ][^.,\n]*|❗️|⚠️|🔥|💥|🛡|🎯|✈️/g;
+
+/* Назва типу цілі — для попапа */
+function targetName(text){
+  if (/герань|шахед|шахід/i.test(text)) return 'Реакт. Герань';
+  if (/ракет|крилат/i.test(text))       return 'Ракета';
+  if (/бпла|дрон|uav/i.test(text))      return 'БПЛА';
+  return 'Повітряна ціль';
+}
+
+/* ============================================================
+   4. КАРТА
+   ============================================================ */
+const map = L.map('map', { zoomControl: true }).setView([50.45, 30.52], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+
+const markerLayer = L.layerGroup().addTo(map);
+
+/* ============================================================
+   5. СТАН
+   ============================================================ */
+const state = new Map(); // key "lat,lng" → { marker, count, ttlTimer, data }
+
+function keyOf(lat, lng){ return lat.toFixed(4)+','+lng.toFixed(4); }
+
+/* ============================================================
+   6. ГЕОМЕТРІЯ
+   ============================================================ */
+function norm(s){
+  return s.toLowerCase().replace(/[’ʼ]/g,"'").replace(/\s+/g,' ').trim();
+}
+function findDistrict(name){
+  const n = norm(name);
+  if (DISTRICTS[n]) return DISTRICTS[n];
+  for (const k in DISTRICTS){
+    if (DISTRICTS[k].lat === 0 && DISTRICTS[k].lng === 0) continue;
+    if (n.includes(k) || k.includes(n)) return DISTRICTS[k];
+  }
+  return null;
+}
+function bearing(a, b){
+  const φ1=a.lat*Math.PI/180, φ2=b.lat*Math.PI/180;
+  const Δλ=(b.lng-a.lng)*Math.PI/180;
+  const y=Math.sin(Δλ)*Math.cos(φ2);
+  const x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  return (Math.atan2(y,x)*180/Math.PI+360)%360;
+}
+function offsetKm(lat, lng, bearingDeg, km){
+  const R=6371, d=km/R, b=bearingDeg*Math.PI/180;
+  const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180;
+  const φ2=Math.asin(Math.sin(φ1)*Math.cos(d)+Math.cos(φ1)*Math.sin(d)*Math.cos(b));
+  const λ2=λ1+Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(φ1),Math.cos(d)-Math.sin(φ1)*Math.sin(φ2));
+  return { lat: φ2*180/Math.PI, lng: λ2*180/Math.PI };
+}
+
+/* ============================================================
+   7. КЛАСИФІКАЦІЯ
+   ============================================================ */
+function classify(text){
+  if (AA_RE.test(text))        return { icon:'🛡', label:'ППО',            color:'#3fb950' };
+  if (FIRE_RE.test(text))      return { icon:'🔥', label:'Пожежа',         color:'#f85149' };
+  if (EXPLOSION_RE.test(text)) return { icon:'💥', label:'Вибух',          color:'#f85149' };
+  if (IMPACT_RE.test(text))    return { icon:'🎯', label:'Влучання',       color:'#d29922' };
+  if (FALL_RE.test(text))      return { icon:'✈️', label:'Повітряна ціль', color:'#58a6ff' };
+  return                              { icon:'❓', label:'Подія',           color:'#8b949e' };
+}
+
+/* ============================================================
+   8. ПАРСЕР
+   ============================================================ */
+function parseMessage(raw){
+  const cleaned = raw.replace(JUNK_RE,' ').replace(/\s+/g,' ').trim();
+  if (!cleaned) return null;
+  const kind = classify(cleaned);
+
+  const povz = cleaned.match(POVZ_RE);
+  if (povz){
+    const from = findDistrict(povz[1]), to = findDistrict(povz[2]);
+    if (from && to) return { kind, point: from, nose: to, text: cleaned, mode:'povz' };
+  }
+
+  const kurs = cleaned.match(KURS_RE);
+  if (kurs){
+    const target = findDistrict(kurs[1]);
+    if (target){
+      const kyiv = { lat:50.4501, lng:30.5234 };
+      const brg  = bearing(kyiv, target);
+      const point= offsetKm(target.lat, target.lng, (brg+180)%360, 5);
+      return { kind, point, nose: target, text: cleaned, mode:'kurs' };
+    }
+  }
+
+  let m, targets = [];
+  TARGET_RE.lastIndex = 0;
+  while ((m = TARGET_RE.exec(cleaned)) !== null) targets.push(m[1]);
+  for (const t of targets){
+    const d = findDistrict(t);
+    if (d) return { kind, point: d, text: cleaned, mode:'target' };
+  }
+
+  return { kind, point: null, text: cleaned, mode:'unknown' };
+}
+
+/* ============================================================
+   9. РЕНДЕР
+   ============================================================ */
+function popupHtml(ev, count){
+  const t = new Date().toLocaleTimeString('uk-UA');
+  const tgt = targetName(ev.text);
+  const isAir = ev.kind.label === 'Повітряна ціль';
+  return `<div style="min-width:210px">
+    <div style="font-size:15px;margin-bottom:6px">${ev.kind.icon} <b>${ev.kind.label}</b></div>
+    ${isAir ? `
+      <div style="background:#7a1f1f;color:#fff;padding:3px 8px;border-radius:4px;
+                  display:inline-block;font-size:12px;margin-bottom:6px">${tgt}</div><br>
+      <div style="background:#1f2a37;color:#8b949e;padding:3px 8px;border-radius:4px;
+                  display:inline-block;font-size:11px;margin-bottom:8px">👁 СПОСТЕРЕЖЕННЯ</div>
+    ` : ''}
+    <div style="color:#8b949e;font-size:12px;margin-bottom:6px">${t} · підтверджень: ${count}</div>
+    <div style="font-size:12px;line-height:1.4">${ev.text}</div>
+  </div>`;
+}
+
+/* Іконка: кружок + стрілка з поворотом навколо центру */
+function makeIcon(ev){
+  const icon = L.divIcon({
+    className:'',
+    html:`<div class="mk-wrap">
+            <div class="mk">✓</div>
+            <div class="arrow"><span class="arrow-body" style="--rot:0deg">➤</span></div>
+          </div>`,
+    iconSize:[40,40], iconAnchor:[20,20]
+  });
+  return icon;
+}
+
+/* Кут повороту: від базового 225° до напрямку на ціль */
+function rotationFor(ev){
+  if (!ev.nose) return 0; // нема цілі — стрілка в базовому положенні
+  const brg = bearing(ev.point, ev.nose);
+  return brg - CONFIG.BASE_ANGLE;
+}
+
+function placeEvent(ev){
+  if (!ev || !ev.point) return;
+  const k = keyOf(ev.point.lat, ev.point.lng);
+  let rec = state.get(k);
+
+  if (rec){
+    rec.count += 1;
+    rec.marker.setPopupContent(popupHtml(ev, rec.count));
+    applyConfirm(rec);
+    bump(rec.marker);
+    resetTTL(rec, ev);
+    return;
+  }
+
+  const marker = L.marker([ev.point.lat, ev.point.lng], { icon: makeIcon(ev) })
+                  .bindPopup(popupHtml(ev, 1))
+                  .addTo(markerLayer);
+
+  // Застосовуємо поворот стрілки одразу після додавання в DOM
+  const rot = rotationFor(ev);
+  setTimeout(() => {
+    const el = marker.getElement()?.querySelector('.arrow-body');
+    if (el) el.style.setProperty('--rot', rot + 'deg');
+  }, 0);
+
+  rec = { marker, count:1, ttlTimer:null, data:ev };
+  state.set(k, rec);
+  applyConfirm(rec);
+  resetTTL(rec, ev);
+}
+
+function applyConfirm(rec){
+  const el = rec.marker.getElement()?.querySelector('.mk');
+  if (!el) return;
+  el.classList.remove('c2','c3','c5');
+  if (rec.count >= CONFIG.CONFIRM_5)      el.classList.add('c5');
+  else if (rec.count >= CONFIG.CONFIRM_3) el.classList.add('c3');
+  else if (rec.count >= CONFIG.CONFIRM_2) el.classList.add('c2');
+  el.textContent = rec.count >= 2 ? '✓' + rec.count : '✓';
+}
+
+function bump(marker){
+  const el = marker.getElement()?.querySelector('.mk-wrap');
+  if (!el) return;
+  el.animate(
+    [{transform:'scale(1)'},{transform:'scale(1.35)'},{transform:'scale(1)'}],
+    {duration:600, easing:'ease-out'}
+  );
+}
+
+function resetTTL(rec, ev){
+  if (rec.ttlTimer) clearTimeout(rec.ttlTimer);
+  rec.ttlTimer = setTimeout(() => removeRecord(rec), CONFIG.TTL_MIN*60*1000);
+}
+function removeRecord(rec){
+  markerLayer.removeLayer(rec.marker);
+  for (const [k,v] of state) if (v === rec) state.delete(k);
+}
+
+/* ============================================================
+   10. ВВІД
+   ============================================================ */
+const logEl = document.getElementById('log');
+function log(msg){
+  const d = document.createElement('div');
+  d.textContent = '· ' + msg;
+  logEl.prepend(d);
+}
+function processInput(){
+  const raw = document.getElementById('input').value;
+  if (!raw.trim()) return;
+  const messages = raw.split(/\n{2,}|(?<=[.!?])\s*\n/).map(s=>s.trim()).filter(Boolean);
+  messages.forEach(m => {
+    const ev = parseMessage(m);
+    if (!ev) return;
+    if (ev.point){
+      placeEvent(ev);
+      log(`${ev.kind.icon} ${ev.kind.label} → ${ev.mode}`);
+    } else {
+      log(`⚠️ точка не знайдена: "${ev.text.slice(0,50)}…"`);
+    }
+  });
+  document.getElementById('input').value = '';
+  updateSummary();
+}
+function loadTests(){
+  document.getElementById('input').value =
+`У Солом'янському районі зафіксовано влучання в офісну будівлю, — КМВА
+
+@kiev_levyy_bereg. ❗️Реактивний шахед падає на Шулявку.
+
+@mon1tor_ua. У Києві влучання на Шулявці, @mon1tor_ua.
+
+Падає Відрадний. Вибух.`;
+}
+function clearAll(){
+  markerLayer.clearLayers();
+  state.forEach(r => r.ttlTimer && clearTimeout(r.ttlTimer));
+  state.clear();
+  logEl.innerHTML = '';
+  updateSummary();
+  log('очищено');
+}
+
+/* ============================================================
+   11. СВОДКА
+   ============================================================ */
+function updateSummary(){
+  // Лічильники по типах цілей (з активних міток)
+  const byType = {};
+  state.forEach(r => {
+    const t = targetName(r.data.text);
+    byType[t] = (byType[t] || 0) + 1;
+  });
+  // Додаємо API-треки
+  for (const k in API_TRACKS.byType){
+    byType[k] = (byType[k] || 0) + API_TRACKS.byType[k];
+  }
+  const total = Object.values(byType).reduce((a,b)=>a+b,0);
+
+  document.getElementById('s-tracks').innerHTML =
+    `✈️ API-треків у зоні: <b>${total}</b>`;
+  const typesLine = Object.entries(byType)
+      .filter(([,v])=>v>0)
+      .map(([k,v])=>`• ${k}: ${v}`)
+      .join(' · ') || '• немає';
+  document.getElementById('s-types').textContent = typesLine;
+
+  document.getElementById('s-updated').textContent =
+    'Оновлено: ' + new Date().toLocaleTimeString('uk-UA');
+}
+
+function copySummary(){
+  const lines = [
+    '🔴 Київ: ПОВІТРЯНА ТРЕВОГА',
+    'Причина: Дронова загроза (жовтий рівень)',
+    document.getElementById('s-tracks').textContent.trim(),
+    '  ' + document.getElementById('s-types').textContent.trim(),
+    '🤖 AI: критичних подій немає',
+    document.getElementById('s-updated').textContent.trim()
+  ];
+  navigator.clipboard.writeText(lines.join('\n'))
+    .then(()=>log('сводку скопійовано'))
+    .catch(()=>log('не вдалось скопіювати'));
+}
+
+/* ============================================================
+   12. СТАРТ
+   ============================================================ */
+updateSummary();
+log('готово. Вставте текст або натисніть «Тести».');
+</script>
+</body>
+</html>
